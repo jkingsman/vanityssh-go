@@ -7,15 +7,18 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"hash"
 	"io/ioutil"
 	"math"
 	"os"
 	"os/signal"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -24,17 +27,36 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-var global_key_regex string
-var global_fp_regex string
-var global_user_streaming bool
-var global_user_help bool
-var global_workers int
+var (
+	global_key_regex      string
+	global_fp_regex       string
+	global_user_streaming bool
+	global_user_help      bool
+	global_workers        int
+	global_batch_size     int
+	global_buffer_size    int
 
-var global_counter int64
-var start time.Time
-var keyRe *regexp.Regexp
-var fpRe *regexp.Regexp
-var err error
+	global_counter int64
+	start          time.Time
+	keyRe          *regexp.Regexp
+	fpRe           *regexp.Regexp
+
+	// Pool for reusing buffers
+	pemBlockPool = sync.Pool{
+		New: func() interface{} {
+			return &pem.Block{Type: "OPENSSH PRIVATE KEY"}
+		},
+	}
+
+	sha256Pool = sync.Pool{
+		New: func() interface{} {
+			return sha256.New()
+		},
+	}
+
+	// Pre-compiled SSH key prefix for faster matching
+	sshKeyPrefix = []byte("ssh-ed25519 ")
+)
 
 func init() {
 	flag.StringVar(&global_key_regex, "key-regex", "", "regex pattern for public key")
@@ -42,6 +64,8 @@ func init() {
 	flag.BoolVar(&global_user_streaming, "streaming", false, "Keep processing keys, even after a match")
 	flag.BoolVar(&global_user_help, "help", false, "Show help message")
 	flag.IntVar(&global_workers, "workers", runtime.NumCPU()*2, "Number of worker goroutines")
+	flag.IntVar(&global_batch_size, "batch", 1000, "Keys to process per batch")
+	flag.IntVar(&global_buffer_size, "buffer", 64, "Random bytes buffer size in KB")
 	flag.Parse()
 
 	if global_user_help {
@@ -51,6 +75,8 @@ func init() {
 		fmt.Println("  -fp-regex string    Regex pattern for fingerprint")
 		fmt.Println("  -streaming         Keep processing keys, even after a match")
 		fmt.Println("  -workers int       Number of worker goroutines (default: NumCPU*2)")
+		fmt.Println("  -batch int         Keys to process per batch (default: 1000)")
+		fmt.Println("  -buffer int        Random bytes buffer size in KB (default: 64)")
 		fmt.Println("  -help              Show this help message")
 		fmt.Println("\nNotes:")
 		fmt.Println("  - If only one regex is specified, the other is considered as always matching")
@@ -62,6 +88,8 @@ func init() {
 
 	start = time.Now()
 
+	// Compile regexes
+	var err error
 	if global_key_regex != "" {
 		keyRe, err = regexp.Compile(global_key_regex)
 		if err != nil {
@@ -82,75 +110,113 @@ func init() {
 		fmt.Println("key-regex =", global_key_regex)
 		fmt.Println("fp-regex =", global_fp_regex)
 		fmt.Println("workers =", global_workers)
+		fmt.Println("batch-size =", global_batch_size)
+		fmt.Println("buffer-size =", global_buffer_size, "KB")
 	}
 }
 
-func WaitForCtrlC() {
-	var end_waiter sync.WaitGroup
-	end_waiter.Add(1)
-	var signal_channel chan os.Signal
-	signal_channel = make(chan os.Signal, 1)
-	signal.Notify(signal_channel, os.Interrupt)
-	go func() {
-		<-signal_channel
-		end_waiter.Done()
-	}()
-	end_waiter.Wait()
+// Optimized random reader with buffering
+type bufferedRandom struct {
+	buf []byte
+	pos int
+	mu  sync.Mutex
 }
 
-// Batch processing for better performance
-func findsshkeysBatch(batchSize int) {
-	// Pre-allocate buffers for batch processing
+func newBufferedRandom(size int) *bufferedRandom {
+	return &bufferedRandom{
+		buf: make([]byte, size*1024), // Convert KB to bytes
+	}
+}
+
+func (b *bufferedRandom) Read(p []byte) (n int, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.pos == 0 {
+		// Refill buffer
+		_, err = rand.Read(b.buf)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	n = copy(p, b.buf[b.pos:])
+	b.pos = (b.pos + n) % len(b.buf)
+	return n, nil
+}
+
+// Worker function with all optimizations
+func findsshkeysBatch(batchSize int, randReader *bufferedRandom) {
+	// Pre-allocate all buffers for this worker
 	pubKeys := make([]ed25519.PublicKey, batchSize)
 	privKeys := make([]ed25519.PrivateKey, batchSize)
+	seeds := make([]byte, batchSize*ed25519.SeedSize)
+
+	// Pre-allocate string builder for key generation
+	var keyBuilder strings.Builder
+	keyBuilder.Grow(128) // Typical SSH key length
 
 	for {
-		// Generate batch of keys
+		// Read all random data at once
+		randReader.Read(seeds)
+
+		// Generate batch of keys from seeds
 		for i := 0; i < batchSize; i++ {
-			pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-			pubKeys[i] = pub
-			privKeys[i] = priv
+			seed := seeds[i*ed25519.SeedSize : (i+1)*ed25519.SeedSize]
+			privKeys[i] = ed25519.NewKeyFromSeed(seed)
+			pubKeys[i] = privKeys[i].Public().(ed25519.PublicKey)
 		}
 
 		// Process batch
 		for i := 0; i < batchSize; i++ {
 			atomic.AddInt64(&global_counter, 1)
 
-			publicKey, _ := ssh.NewPublicKey(pubKeys[i])
-
-			matchedKey := true // Default to true if no key regex specified
-			matchedFp := true  // Default to true if no fp regex specified
+			// Early exit checks
+			matchedKey := keyRe == nil
+			matchedFp := fpRe == nil
 
 			var keyStr, fpStr string
+			var publicKey ssh.PublicKey
 
-			// Only compute what we need to check
-			if keyRe != nil {
-				keyStr = getAuthorizedKey(publicKey)
+			// Only create SSH public key if we need to check something
+			if !matchedKey || !matchedFp {
+				publicKey, _ = ssh.NewPublicKey(pubKeys[i])
+			}
+
+			// Check key regex if needed
+			if !matchedKey {
+				keyStr = getAuthorizedKeyFast(publicKey, &keyBuilder)
 				matchedKey = keyRe.MatchString(keyStr)
 			}
 
-			// Skip fingerprint calculation if key already doesn't match
-			if matchedKey && fpRe != nil {
-				fpStr = getFingerprint(publicKey)
+			// Skip fingerprint if key doesn't match
+			if matchedKey && !matchedFp {
+				fpStr = getFingerprintFast(publicKey)
 				matchedFp = fpRe.MatchString(fpStr)
 			}
 
-			// Both must match (or be true by default if not specified)
+			// Both must match
 			if matchedKey && matchedFp {
 				// Compute missing values if needed
+				if publicKey == nil {
+					publicKey, _ = ssh.NewPublicKey(pubKeys[i])
+				}
 				if keyStr == "" {
-					keyStr = getAuthorizedKey(publicKey)
+					keyStr = getAuthorizedKeyFast(publicKey, &keyBuilder)
 				}
 				if fpStr == "" {
-					fpStr = getFingerprint(publicKey)
+					fpStr = getFingerprintFast(publicKey)
 				}
 
-				pemKey := &pem.Block{
-					Type:  "OPENSSH PRIVATE KEY",
-					Bytes: edkey.MarshalED25519PrivateKey(privKeys[i]),
-				}
+				// Get a pem.Block from the pool
+				pemKey := pemBlockPool.Get().(*pem.Block)
+				pemKey.Bytes = edkey.MarshalED25519PrivateKey(privKeys[i])
 				privateKey := pem.EncodeToMemory(pemKey)
 
+				// Return pem.Block to pool
+				pemBlockPool.Put(pemKey)
+
+				// Output results
 				fmt.Printf("\033[2K\r%s%d", "SSH Keys Processed = ", atomic.LoadInt64(&global_counter))
 				fmt.Println("\nTotal execution time", time.Since(start))
 				fmt.Printf("%s\n", privateKey)
@@ -167,16 +233,22 @@ func findsshkeysBatch(batchSize int) {
 	}
 }
 
-// Generate a SHA256 fingerprint of a public key
-func getFingerprint(key ssh.PublicKey) string {
-	h := sha256.New()
+// Optimized fingerprint generation using pooled hashers
+func getFingerprintFast(key ssh.PublicKey) string {
+	h := sha256Pool.Get().(hash.Hash)
+	h.Reset()
 	h.Write(key.Marshal())
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+	result := h.Sum(nil)
+	sha256Pool.Put(h)
+	return base64.StdEncoding.EncodeToString(result)
 }
 
-// Generate an `authorized_keys` line for a public key
-func getAuthorizedKey(key ssh.PublicKey) string {
-	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key)))
+// Optimized authorized key generation with string builder reuse
+func getAuthorizedKeyFast(key ssh.PublicKey, builder *strings.Builder) string {
+	builder.Reset()
+	builder.Write(sshKeyPrefix)
+	builder.WriteString(base64.StdEncoding.EncodeToString(key.Marshal()))
+	return builder.String()
 }
 
 func expMovingAverage(value, oldValue, deltaTime, timeWindow float64) float64 {
@@ -192,22 +264,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set GOMAXPROCS to ensure all CPU cores are used
+	// Performance tuning
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// Start worker goroutines with batch processing
-	batchSize := 100 // Process keys in batches for better performance
+	// Tune GC for throughput over latency
+	debug.SetGCPercent(200) // Less frequent GC
+
+	// Set process priority (Unix-like systems)
+	syscall.Setpriority(syscall.PRIO_PROCESS, 0, -10)
+
+	// Create buffered random readers for each worker
+	randReaders := make([]*bufferedRandom, global_workers)
 	for i := 0; i < global_workers; i++ {
-		go findsshkeysBatch(batchSize)
+		randReaders[i] = newBufferedRandom(global_buffer_size)
+	}
+
+	// Start worker goroutines
+	for i := 0; i < global_workers; i++ {
+		go findsshkeysBatch(global_batch_size, randReaders[i])
 	}
 
 	fmt.Printf("Press Ctrl+C to end\n")
 
-	// Create a separate goroutine for stats display to avoid blocking
+	// Stats display goroutine
 	go func() {
 		deleteLine := "\033[2K\r"
 		cursorUp := "\033[A"
+		cursorUp2 := "\033[A\033[A"
 		avgKeyRate := float64(0)
+		peakKeyRate := float64(0)
 		oldCounter := int64(0)
 		oldTime := time.Now()
 
@@ -217,14 +302,22 @@ func main() {
 			currentCounter := atomic.LoadInt64(&global_counter)
 			relTime := time.Since(oldTime).Seconds()
 
-			// on first run, initialize the moving average with the current rate
 			if oldCounter == 0 {
 				avgKeyRate = float64(currentCounter)
 			}
 
-			fmt.Printf("%s%s%s", deleteLine, cursorUp, deleteLine)
-			fmt.Printf("SSH Keys Processed = %s\n", humanize.Comma(currentCounter))
-			fmt.Printf("kKeys/s = %.2f", avgKeyRate/relTime/1000)
+			currentRate := float64(currentCounter-oldCounter) / relTime / 1000
+			if currentRate > peakKeyRate {
+				peakKeyRate = currentRate
+			}
+
+			fmt.Printf("%s%s%s%s", deleteLine, cursorUp2, deleteLine, cursorUp)
+			fmt.Printf("SSH Keys Processed = %s (%.2f%%)\n",
+				humanize.Comma(currentCounter),
+				float64(currentCounter)/float64(1<<64)*100) // Progress through keyspace
+			fmt.Printf("kKeys/s = %.2f (avg) | %.2f (current) | %.2f (peak)\n",
+				avgKeyRate/relTime/1000, currentRate, peakKeyRate)
+			fmt.Printf("Runtime = %s", time.Since(start).Round(time.Second))
 
 			avgKeyRate = expMovingAverage(
 				float64(currentCounter-oldCounter), avgKeyRate, relTime, 5)
@@ -233,6 +326,15 @@ func main() {
 		}
 	}()
 
-	WaitForCtrlC()
-	fmt.Printf("\n")
+	// Handle signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+
+	// Final stats
+	fmt.Printf("\n\nFinal Statistics:\n")
+	fmt.Printf("Total keys processed: %s\n", humanize.Comma(atomic.LoadInt64(&global_counter)))
+	fmt.Printf("Total runtime: %s\n", time.Since(start))
+	fmt.Printf("Average rate: %.2f kKeys/s\n",
+		float64(atomic.LoadInt64(&global_counter))/time.Since(start).Seconds()/1000)
 }
