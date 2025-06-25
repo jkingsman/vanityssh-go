@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -27,6 +28,7 @@ var global_key_regex string
 var global_fp_regex string
 var global_user_streaming bool
 var global_user_help bool
+var global_workers int
 
 var global_counter int64
 var start time.Time
@@ -39,6 +41,7 @@ func init() {
 	flag.StringVar(&global_fp_regex, "fp-regex", "", "regex pattern for fingerprint")
 	flag.BoolVar(&global_user_streaming, "streaming", false, "Keep processing keys, even after a match")
 	flag.BoolVar(&global_user_help, "help", false, "Show help message")
+	flag.IntVar(&global_workers, "workers", runtime.NumCPU()*2, "Number of worker goroutines")
 	flag.Parse()
 
 	if global_user_help {
@@ -47,6 +50,7 @@ func init() {
 		fmt.Println("  -key-regex string   Regex pattern for public key")
 		fmt.Println("  -fp-regex string    Regex pattern for fingerprint")
 		fmt.Println("  -streaming         Keep processing keys, even after a match")
+		fmt.Println("  -workers int       Number of worker goroutines (default: NumCPU*2)")
 		fmt.Println("  -help              Show this help message")
 		fmt.Println("\nNotes:")
 		fmt.Println("  - If only one regex is specified, the other is considered as always matching")
@@ -77,6 +81,7 @@ func init() {
 	if global_key_regex != "" || global_fp_regex != "" {
 		fmt.Println("key-regex =", global_key_regex)
 		fmt.Println("fp-regex =", global_fp_regex)
+		fmt.Println("workers =", global_workers)
 	}
 }
 
@@ -93,41 +98,70 @@ func WaitForCtrlC() {
 	end_waiter.Wait()
 }
 
-func findsshkeys() {
+// Batch processing for better performance
+func findsshkeysBatch(batchSize int) {
+	// Pre-allocate buffers for batch processing
+	pubKeys := make([]ed25519.PublicKey, batchSize)
+	privKeys := make([]ed25519.PrivateKey, batchSize)
+
 	for {
-		global_counter++
-		pubKey, privKey, _ := ed25519.GenerateKey(rand.Reader)
-		publicKey, _ := ssh.NewPublicKey(pubKey)
-		pemKey := &pem.Block{
-			Type:  "OPENSSH PRIVATE KEY",
-			Bytes: edkey.MarshalED25519PrivateKey(privKey),
-		}
-		privateKey := pem.EncodeToMemory(pemKey)
-
-		matchedKey := true // Default to true if no key regex specified
-		matchedFp := true  // Default to true if no fp regex specified
-		keyStr := getAuthorizedKey(publicKey)
-		fpStr := getFingerprint(publicKey)
-
-		// Only check if regex is specified
-		if keyRe != nil {
-			matchedKey = keyRe.MatchString(keyStr)
-		}
-		if fpRe != nil {
-			matchedFp = fpRe.MatchString(fpStr)
+		// Generate batch of keys
+		for i := 0; i < batchSize; i++ {
+			pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+			pubKeys[i] = pub
+			privKeys[i] = priv
 		}
 
-		// Both must match (or be true by default if not specified)
-		if matchedKey && matchedFp {
-			fmt.Printf("\033[2K\r%s%d", "SSH Keys Processed = ", global_counter)
-			fmt.Println("\nTotal execution time", time.Since(start))
-			fmt.Printf("%s\n", privateKey)
-			fmt.Printf("%s\n", keyStr)
-			fmt.Printf("SHA256:%s\n", fpStr)
-			if global_user_streaming == false {
-				_ = ioutil.WriteFile("id_ed25519", privateKey, 0600)
-				_ = ioutil.WriteFile("id_ed25519.pub", []byte(keyStr), 0644)
-				os.Exit(0)
+		// Process batch
+		for i := 0; i < batchSize; i++ {
+			atomic.AddInt64(&global_counter, 1)
+
+			publicKey, _ := ssh.NewPublicKey(pubKeys[i])
+
+			matchedKey := true // Default to true if no key regex specified
+			matchedFp := true  // Default to true if no fp regex specified
+
+			var keyStr, fpStr string
+
+			// Only compute what we need to check
+			if keyRe != nil {
+				keyStr = getAuthorizedKey(publicKey)
+				matchedKey = keyRe.MatchString(keyStr)
+			}
+
+			// Skip fingerprint calculation if key already doesn't match
+			if matchedKey && fpRe != nil {
+				fpStr = getFingerprint(publicKey)
+				matchedFp = fpRe.MatchString(fpStr)
+			}
+
+			// Both must match (or be true by default if not specified)
+			if matchedKey && matchedFp {
+				// Compute missing values if needed
+				if keyStr == "" {
+					keyStr = getAuthorizedKey(publicKey)
+				}
+				if fpStr == "" {
+					fpStr = getFingerprint(publicKey)
+				}
+
+				pemKey := &pem.Block{
+					Type:  "OPENSSH PRIVATE KEY",
+					Bytes: edkey.MarshalED25519PrivateKey(privKeys[i]),
+				}
+				privateKey := pem.EncodeToMemory(pemKey)
+
+				fmt.Printf("\033[2K\r%s%d", "SSH Keys Processed = ", atomic.LoadInt64(&global_counter))
+				fmt.Println("\nTotal execution time", time.Since(start))
+				fmt.Printf("%s\n", privateKey)
+				fmt.Printf("%s\n", keyStr)
+				fmt.Printf("SHA256:%s\n", fpStr)
+
+				if !global_user_streaming {
+					_ = ioutil.WriteFile("id_ed25519", privateKey, 0600)
+					_ = ioutil.WriteFile("id_ed25519.pub", []byte(keyStr), 0644)
+					os.Exit(0)
+				}
 			}
 		}
 	}
@@ -158,39 +192,46 @@ func main() {
 		os.Exit(1)
 	}
 
-	//	input threads, else numcpu
-	for i := 1; i <= runtime.NumCPU(); i++ {
-		go findsshkeys()
+	// Set GOMAXPROCS to ensure all CPU cores are used
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// Start worker goroutines with batch processing
+	batchSize := 100 // Process keys in batches for better performance
+	for i := 0; i < global_workers; i++ {
+		go findsshkeysBatch(batchSize)
 	}
 
 	fmt.Printf("Press Ctrl+C to end\n")
 
-	deleteLine := "\033[2K\r"
-	cursorUp := "\033[A"
-	avgKeyRate := float64(global_counter)
-	oldCounter := global_counter
-	oldTime := time.Now()
+	// Create a separate goroutine for stats display to avoid blocking
+	go func() {
+		deleteLine := "\033[2K\r"
+		cursorUp := "\033[A"
+		avgKeyRate := float64(0)
+		oldCounter := int64(0)
+		oldTime := time.Now()
 
-	for {
-		time.Sleep(250 * time.Millisecond)
-		relTime := time.Since(oldTime).Seconds()
+		for {
+			time.Sleep(250 * time.Millisecond)
 
-		// on first run, initialize the moving average with the current rate
-		// instead of starting at 0 and taking many seconds to tend towards the
-		// actual key rate
-		if oldCounter == 0 {
-			avgKeyRate = float64(global_counter)
+			currentCounter := atomic.LoadInt64(&global_counter)
+			relTime := time.Since(oldTime).Seconds()
+
+			// on first run, initialize the moving average with the current rate
+			if oldCounter == 0 {
+				avgKeyRate = float64(currentCounter)
+			}
+
+			fmt.Printf("%s%s%s", deleteLine, cursorUp, deleteLine)
+			fmt.Printf("SSH Keys Processed = %s\n", humanize.Comma(currentCounter))
+			fmt.Printf("kKeys/s = %.2f", avgKeyRate/relTime/1000)
+
+			avgKeyRate = expMovingAverage(
+				float64(currentCounter-oldCounter), avgKeyRate, relTime, 5)
+			oldCounter = currentCounter
+			oldTime = time.Now()
 		}
-
-		fmt.Printf("%s%s%s", deleteLine, cursorUp, deleteLine)
-		fmt.Printf("SSH Keys Processed = %s\n", humanize.Comma(global_counter))
-		fmt.Printf("kKeys/s = %.2f", avgKeyRate/relTime/1000)
-
-		avgKeyRate = expMovingAverage(
-			float64(global_counter-oldCounter), avgKeyRate, relTime, 5)
-		oldCounter = global_counter
-		oldTime = time.Now()
-	}
+	}()
 
 	WaitForCtrlC()
 	fmt.Printf("\n")
