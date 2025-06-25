@@ -1,6 +1,18 @@
 # vanityssh-go
 vanityssh allows you to generate millions of ED25519 private keys in the OpenSSH private key format and run a regex search against the resulting public keys. You can use this to find patterns in ssh public keys that you like.
 
+## Installation
+
+```
+git clone <repo git url>
+cd vanityssh-go
+
+sudo apt update
+sudo apt install golang-go git
+go build -ldflags="-s -w" vanityssh.go
+./vanityssh <etc>
+```
+
 ## Is it safe to use?
 ¯\\\_(ツ)\_/¯
 
