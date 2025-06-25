@@ -23,34 +23,61 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-var global_user_input string
-var global_user_insensitive bool
+var global_key_regex string
+var global_fp_regex string
 var global_user_streaming bool
-var global_user_fingerprint bool
+var global_user_help bool
 
-// var flagvar int
 var global_counter int64
 var start time.Time
-var re *regexp.Regexp
+var keyRe *regexp.Regexp
+var fpRe *regexp.Regexp
 var err error
 
 func init() {
-	flag.StringVar(&global_user_input, "regex", "", "regex pattern goes here")
-	flag.BoolVar(&global_user_insensitive, "insensitive", false, "case-insensitive")
+	flag.StringVar(&global_key_regex, "key-regex", "", "regex pattern for public key")
+	flag.StringVar(&global_fp_regex, "fp-regex", "", "regex pattern for fingerprint")
 	flag.BoolVar(&global_user_streaming, "streaming", false, "Keep processing keys, even after a match")
-	flag.BoolVar(&global_user_fingerprint, "fingerprint", false, "Match against fingerprint instead of public key")
+	flag.BoolVar(&global_user_help, "help", false, "Show help message")
 	flag.Parse()
+
+	if global_user_help {
+		fmt.Println("SSH Key Generator - Generates ED25519 SSH keys matching regex patterns")
+		fmt.Println("\nUsage:")
+		fmt.Println("  -key-regex string   Regex pattern for public key")
+		fmt.Println("  -fp-regex string    Regex pattern for fingerprint")
+		fmt.Println("  -streaming         Keep processing keys, even after a match")
+		fmt.Println("  -help              Show this help message")
+		fmt.Println("\nNotes:")
+		fmt.Println("  - If only one regex is specified, the other is considered as always matching")
+		fmt.Println("  - If both are specified, both must match")
+		fmt.Println("  - For case-insensitive matching, use (?i) at the start of your regex pattern")
+		fmt.Println("    Example: -key-regex '(?i).*abc.*' will match ABC, abc, AbC, etc.")
+		os.Exit(0)
+	}
+
 	start = time.Now()
 
-	if global_user_insensitive == false {
-		re, err = regexp.Compile(global_user_input)
-	} else {
-		re, err = regexp.Compile("(?i)" + global_user_input)
+	if global_key_regex != "" {
+		keyRe, err = regexp.Compile(global_key_regex)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid key-regex: %v\n", err)
+			os.Exit(1)
+		}
 	}
-	if err != nil {
-		os.Exit(1)
+	if global_fp_regex != "" {
+		fpRe, err = regexp.Compile(global_fp_regex)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid fp-regex: %v\n", err)
+			os.Exit(1)
+		}
 	}
-	fmt.Println("global_user_input =", global_user_input)
+
+	// Only print if at least one regex is specified
+	if global_key_regex != "" || global_fp_regex != "" {
+		fmt.Println("key-regex =", global_key_regex)
+		fmt.Println("fp-regex =", global_fp_regex)
+	}
 }
 
 func WaitForCtrlC() {
@@ -77,22 +104,29 @@ func findsshkeys() {
 		}
 		privateKey := pem.EncodeToMemory(pemKey)
 
-		matched := false
-		if global_user_fingerprint {
-			matched = re.MatchString(getFingerprint(publicKey))
-		} else {
-			matched = re.MatchString(getAuthorizedKey(publicKey))
+		matchedKey := true // Default to true if no key regex specified
+		matchedFp := true  // Default to true if no fp regex specified
+		keyStr := getAuthorizedKey(publicKey)
+		fpStr := getFingerprint(publicKey)
+
+		// Only check if regex is specified
+		if keyRe != nil {
+			matchedKey = keyRe.MatchString(keyStr)
+		}
+		if fpRe != nil {
+			matchedFp = fpRe.MatchString(fpStr)
 		}
 
-		if matched {
+		// Both must match (or be true by default if not specified)
+		if matchedKey && matchedFp {
 			fmt.Printf("\033[2K\r%s%d", "SSH Keys Processed = ", global_counter)
 			fmt.Println("\nTotal execution time", time.Since(start))
 			fmt.Printf("%s\n", privateKey)
-			fmt.Printf("%s\n", getAuthorizedKey(publicKey))
-			fmt.Printf("SHA256:%s\n", getFingerprint(publicKey))
+			fmt.Printf("%s\n", keyStr)
+			fmt.Printf("SHA256:%s\n", fpStr)
 			if global_user_streaming == false {
 				_ = ioutil.WriteFile("id_ed25519", privateKey, 0600)
-				_ = ioutil.WriteFile("id_ed25519.pub", []byte(getAuthorizedKey(publicKey)), 0644)
+				_ = ioutil.WriteFile("id_ed25519.pub", []byte(keyStr), 0644)
 				os.Exit(0)
 			}
 		}
@@ -117,6 +151,13 @@ func expMovingAverage(value, oldValue, deltaTime, timeWindow float64) float64 {
 }
 
 func main() {
+	// Validate that at least one regex is provided
+	if global_key_regex == "" && global_fp_regex == "" {
+		fmt.Fprintf(os.Stderr, "Error: At least one of -key-regex or -fp-regex must be specified\n")
+		fmt.Fprintf(os.Stderr, "Use -help for more information\n")
+		os.Exit(1)
+	}
+
 	//	input threads, else numcpu
 	for i := 1; i <= runtime.NumCPU(); i++ {
 		go findsshkeys()
