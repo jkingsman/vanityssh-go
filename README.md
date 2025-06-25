@@ -8,7 +8,7 @@ git clone <repo git url>
 cd vanityssh-go
 
 sudo apt update
-sudo apt install golang-go git
+sudo apt install -y golang-go
 go build -ldflags="-s -w" vanityssh.go
 ./vanityssh <etc>
 ```
